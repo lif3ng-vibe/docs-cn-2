@@ -148,3 +148,7 @@ jobs:
     steps:
       - id: deployment
         uses: actions/deploy-pages@v4
+        with:
+          # 默认 600s：首建轮 syncing_files 冷同步 10 分钟超时红（1.5GB tar 在
+          # hub 好轮仅 4m11s，体积不是瓶颈）；提到 20 分钟容 Pages 同步波动
+          timeout: 1200000
