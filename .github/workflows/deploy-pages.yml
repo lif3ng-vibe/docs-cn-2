@@ -1,0 +1,150 @@
+name: Deploy to GitHub Pages
+
+on:
+  workflow_dispatch:
+    inputs:
+      sites:
+        description: '要构建的站点 slug（逗号分隔，留空=全部）'
+        required: false
+        default: ''
+      ref:
+        description: 'hub 仓库 lif3ng-vibe/docs-cn 的 ref（分支/commit）'
+        required: false
+        default: master
+
+# 允许 Pages 部署
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 同一时间只跑一条部署
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+# docs-cn-2 分仓：ai-sdk + litellm + impeccable-mirror。本仓不含任何站点内容——
+# 构建时 checkout hub 仓库 lif3ng-vibe/docs-cn@inputs.ref（hub 唯一事实源，无
+# submodule），按分仓定档构建，产物部署到本仓 Pages：https://lif3ng-vibe.github.io/docs-cn-2/。
+# 触发：hub deploy 成功后 dispatch-siblings job（secret DOCS_DISPATCH_TOKEN）
+# 指名 sites 清单触发本 workflow；也可手动
+#   gh workflow run deploy-pages.yml -R lif3ng-vibe/docs-cn-2 -f sites=ai-sdk,litellm,impeccable-mirror -f ref=master
+# 缓存（actions/cache）存在本仓名下，key 只掺站点目录内容、不掺 workflow 文件
+# （改 CI 文件不炸缓存，与 hub 31e88a46 同口径）；7 天未用被逐出后 miss 自愈重建。
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve site list
+        run: |
+          if [ -n "${{ inputs.sites }}" ]; then
+            echo "DOCS_SITES=${{ inputs.sites }}" >> "$GITHUB_ENV"
+          else
+            echo "DOCS_SITES=ai-sdk,litellm,impeccable-mirror" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          repository: lif3ng-vibe/docs-cn
+          ref: ${{ inputs.ref || 'master' }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: litellm-docs-cn/package-lock.json
+
+      - name: Prepare _site
+        run: mkdir -p _site
+
+      # ai-sdk 是 pnpm monorepo（geistdocs/fumadocs + Next.js 16 静态导出）：basePath
+      # 写死在 apps/docs/lib/base-path.ts、next.config.ts（注释）与
+      # apps/docs/scripts/postprocess-export.mjs（字面量 /docs-cn/ai-sdk），分仓
+      # 前缀在构建前做源码级字面量替换；canonical/sitemap 由
+      # NEXT_PUBLIC_VERCEL_PROJECT_PRODUCTION_URL 注入（须带新子路径）；
+      # 搜索是构建期静态索引，无需服务端。产物 out/ 在 apps/docs/ 根层。
+      - name: Restore ai-sdk-docs-cn dist
+        id: dist-ai-sdk
+        if: contains(env.DOCS_SITES, 'ai-sdk')
+        uses: actions/cache@v4
+        with:
+          path: _site/ai-sdk
+          key: dist-ai-sdk-${{ hashFiles('ai-sdk-docs-cn/**') }}
+
+      - name: Build ai-sdk-docs-cn
+        if: contains(env.DOCS_SITES, 'ai-sdk') && steps.dist-ai-sdk.outputs.cache-hit != 'true'
+        working-directory: ai-sdk-docs-cn
+        env:
+          NEXT_PUBLIC_VERCEL_PROJECT_PRODUCTION_URL: https://lif3ng-vibe.github.io/docs-cn-2/ai-sdk
+        run: |
+          grep -rl --include='*.ts' --include='*.mjs' '/docs-cn/ai-sdk' apps/docs \
+            | xargs -r sed -i 's|/docs-cn/ai-sdk|/docs-cn-2/ai-sdk|g'
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm --filter ai-sdk-docs build
+          mv apps/docs/out ../_site/ai-sdk
+
+      # litellm 是标准 Docusaurus 3.8（715+ 文件）：baseUrl/url 走 DOCS_BASE（要求
+      # 尾斜杠）/DOCS_SITE env，内链由 Docusaurus 自带 base 前缀处理，无 CI sed；
+      # 大构建需显式堆上限（上游同款 6G）。
+      - name: Restore litellm-docs-cn dist
+        id: dist-litellm
+        if: contains(env.DOCS_SITES, 'litellm')
+        uses: actions/cache@v4
+        with:
+          path: _site/litellm
+          key: dist-litellm-${{ hashFiles('litellm-docs-cn/**') }}
+
+      - name: Build litellm-docs-cn
+        if: contains(env.DOCS_SITES, 'litellm') && steps.dist-litellm.outputs.cache-hit != 'true'
+        working-directory: litellm-docs-cn
+        env:
+          DOCS_SITE: https://lif3ng-vibe.github.io
+          DOCS_BASE: /docs-cn-2/litellm/
+          NODE_OPTIONS: --max-old-space-size=6144
+        run: |
+          npm ci
+          npm run build
+          mv build ../_site/litellm
+
+      # impeccable-mirror-cn 是线上构建产物镜像（无构建系统，rewrite-base.mjs 改写
+      # 非幂等，不重跑）：站内根相对链接在 site/ 里已是 /docs-cn/impeccable-mirror/
+      # 字面量前缀，分仓前缀做产物级字面量替换（站点自部署文本文件类型与
+      # rewrite-base.mjs 的处理范围一致）。
+      - name: Restore impeccable-mirror-cn dist
+        id: dist-impeccable-mirror
+        if: contains(env.DOCS_SITES, 'impeccable-mirror')
+        uses: actions/cache@v4
+        with:
+          path: _site/impeccable-mirror
+          key: dist-impeccable-mirror-${{ hashFiles('impeccable-mirror-cn/**') }}
+
+      - name: Collect impeccable-mirror-cn
+        if: contains(env.DOCS_SITES, 'impeccable-mirror') && steps.dist-impeccable-mirror.outputs.cache-hit != 'true'
+        working-directory: impeccable-mirror-cn
+        run: |
+          find site -type f \( -name '*.html' -o -name '*.css' -o -name '*.js' -o -name '*.json' -o -name '*.xml' -o -name '*.txt' -o -name '*.svg' -o -name '*.webmanifest' \) \
+            -exec sed -i 's|/docs-cn/impeccable-mirror|/docs-cn-2/impeccable-mirror|g' {} +
+          mv site ../_site/impeccable-mirror
+
+      - name: Assemble Pages artifact
+        run: |
+          # 本仓无入口页（hub 承担目录）：_site 只放各站点产物目录
+          du -sm _site/* | sort -rn | head -15 || true
+          du -sm _site | tail -1
+          # GitHub Pages 需要 .nojekyll 避免下划线开头的 _astro 等目录被忽略
+          touch _site/.nojekyll
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
