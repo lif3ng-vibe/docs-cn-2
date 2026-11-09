@@ -11,6 +11,11 @@ on:
         description: 'hub 仓库 lif3ng-vibe/docs-cn 的 ref（分支/commit）'
         required: false
         default: master
+      no_cache:
+        description: '跳过缓存强制重建（CI 前缀逻辑修复轮用——缓存 key 只随内容变，不随本文件变）'
+        type: boolean
+        required: false
+        default: false
 
 # 允许 Pages 部署
 permissions:
@@ -58,14 +63,17 @@ jobs:
         run: mkdir -p _site
 
       # ai-sdk 是 pnpm monorepo（geistdocs/fumadocs + Next.js 16 静态导出）：basePath
-      # 写死在 apps/docs/lib/base-path.ts、next.config.ts（注释）与
-      # apps/docs/scripts/postprocess-export.mjs（字面量 /docs-cn/ai-sdk），分仓
-      # 前缀在构建前做源码级字面量替换；canonical/sitemap 由
+      # 写死在 apps/docs/lib/base-path.ts、next.config.ts（注释）、postprocess-export.mjs
+      # 与 public/robots.txt 的 Sitemap 行（字面量 /docs-cn/ai-sdk），分仓前缀在
+      # 构建前做源码级字面量替换；canonical/sitemap 由
       # NEXT_PUBLIC_VERCEL_PROJECT_PRODUCTION_URL 注入（须带新子路径）；
       # 搜索是构建期静态索引，无需服务端。产物 out/ 在 apps/docs/ 根层。
+      # 缓存 restore 不做站选 gate：未选中的站靠缓存凑产物（否则单站 dispatch
+      # 会上传缺站工件，把该站从线上抹掉）；仅「选中站 + no_cache」跳过 restore
+      # 强制重建。Assemble 步校验全站齐全兜底。
       - name: Restore ai-sdk-docs-cn dist
         id: dist-ai-sdk
-        if: contains(env.DOCS_SITES, 'ai-sdk')
+        if: inputs.no_cache != true || !contains(env.DOCS_SITES, 'ai-sdk')
         uses: actions/cache@v4
         with:
           path: _site/ai-sdk
@@ -77,7 +85,7 @@ jobs:
         env:
           NEXT_PUBLIC_VERCEL_PROJECT_PRODUCTION_URL: https://lif3ng-vibe.github.io/docs-cn-2/ai-sdk
         run: |
-          grep -rl --include='*.ts' --include='*.mjs' '/docs-cn/ai-sdk' apps/docs \
+          grep -rl --include='*.ts' --include='*.mjs' --include='*.txt' --include='*.md' --include='*.mdx' '/docs-cn/ai-sdk' apps/docs \
             | xargs -r sed -i 's|/docs-cn/ai-sdk|/docs-cn-2/ai-sdk|g'
           corepack enable
           pnpm install --frozen-lockfile
@@ -89,7 +97,7 @@ jobs:
       # 大构建需显式堆上限（上游同款 6G）。
       - name: Restore litellm-docs-cn dist
         id: dist-litellm
-        if: contains(env.DOCS_SITES, 'litellm')
+        if: inputs.no_cache != true || !contains(env.DOCS_SITES, 'litellm')
         uses: actions/cache@v4
         with:
           path: _site/litellm
@@ -113,7 +121,7 @@ jobs:
       # rewrite-base.mjs 的处理范围一致）。
       - name: Restore impeccable-mirror-cn dist
         id: dist-impeccable-mirror
-        if: contains(env.DOCS_SITES, 'impeccable-mirror')
+        if: inputs.no_cache != true || !contains(env.DOCS_SITES, 'impeccable-mirror')
         uses: actions/cache@v4
         with:
           path: _site/impeccable-mirror
@@ -129,6 +137,11 @@ jobs:
 
       - name: Assemble Pages artifact
         run: |
+          # 防单站 dispatch 缺站：工件必须含本仓全部定档站点，缺任一整轮红
+          # （否则 upload 会把线上其他站抹掉）
+          for slug in ai-sdk litellm impeccable-mirror; do
+            [ -d "_site/$slug" ] || { echo "::error::_site/$slug 缺失（缓存未命中且未构建）"; exit 1; }
+          done
           # 本仓无入口页（hub 承担目录）：_site 只放各站点产物目录
           du -sm _site/* | sort -rn | head -15 || true
           du -sm _site | tail -1
